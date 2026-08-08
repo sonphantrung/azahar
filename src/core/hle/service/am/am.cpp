@@ -136,11 +136,6 @@ void NCCHCryptoFile::Write(const u8* buffer, std::size_t length) {
         }
 
         if (!ncch_header.no_crypto) {
-            if (!decryption_authorized) {
-                LOG_ERROR(Service_AM, "Blocked unauthorized encrypted CIA installation.");
-                is_error = true;
-                return;
-            }
             is_encrypted = true;
 
             // Find primary and secondary keys
@@ -571,14 +566,6 @@ ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length,
                                  buffer + (range_min - offset) + available_to_write);
 
             if ((tmd.GetContentTypeByIndex(i) & FileSys::TMDContentTypeFlag::Encrypted) != 0) {
-                if (!decryption_authorized) {
-                    LOG_ERROR(Service_AM, "Blocked unauthorized encrypted CIA installation.");
-                    current_content_install_result.result =
-                        Result(ErrorDescription::NotAuthorized, ErrorModule::AM,
-                               ErrorSummary::InvalidState, ErrorLevel::Permanent);
-                    install_results.push_back(current_content_install_result);
-                    return current_content_install_result.result;
-                }
                 decryption_state->content[i].ProcessData(temp.data(), temp.data(), temp.size());
             }
 
@@ -702,23 +689,17 @@ Result CIAFile::PrepareToImportContent(const FileSys::TitleMetadata& tmd) {
 
     if (container.GetTitleMetadata().HasEncryptedContent(from_cdn ? nullptr
                                                                   : container.GetHeader())) {
-        if (!decryption_authorized) {
-            LOG_ERROR(Service_AM, "Blocked unauthorized encrypted CIA installation.");
-            return {ErrorDescription::NotAuthorized, ErrorModule::AM, ErrorSummary::InvalidState,
-                    ErrorLevel::Permanent};
-        } else {
-            if (auto title_key = container.GetTicket().GetTitleKey()) {
-                decryption_state->content.resize(content_count);
-                for (std::size_t i = 0; i < content_count; ++i) {
-                    auto ctr = tmd.GetContentCTRByIndex(i);
-                    decryption_state->content[i].SetKeyWithIV(title_key->data(), title_key->size(),
-                                                              ctr.data());
-                }
-            } else {
-                LOG_ERROR(Service_AM, "Could not read title key from ticket for encrypted CIA.");
-                // TODO: Correct error code.
-                return FileSys::ResultFileNotFound;
+        if (auto title_key = container.GetTicket().GetTitleKey()) {
+            decryption_state->content.resize(content_count);
+            for (std::size_t i = 0; i < content_count; ++i) {
+                auto ctr = tmd.GetContentCTRByIndex(i);
+                decryption_state->content[i].SetKeyWithIV(title_key->data(), title_key->size(),
+                                                          ctr.data());
             }
+        } else {
+            LOG_ERROR(Service_AM, "Could not read title key from ticket for encrypted CIA.");
+            // TODO: Correct error code.
+            return FileSys::ResultFileNotFound;
         }
     } else {
         LOG_INFO(Service_AM,
@@ -807,14 +788,6 @@ ResultVal<std::size_t> CIAFile::WriteContentDataIndexed(u16 content_index, u64 o
     std::vector<u8> temp(buffer, buffer + std::min(static_cast<u64>(length), remaining_to_write));
 
     if ((tmd.GetContentTypeByIndex(content_index) & FileSys::TMDContentTypeFlag::Encrypted) != 0) {
-        if (!decryption_authorized) {
-            LOG_ERROR(Service_AM, "Blocked unauthorized encrypted CIA installation.");
-            current_content_install_result.result =
-                Result(ErrorDescription::NotAuthorized, ErrorModule::AM, ErrorSummary::InvalidState,
-                       ErrorLevel::Permanent);
-            install_results.push_back(current_content_install_result);
-            return current_content_install_result.result;
-        }
         decryption_state->content[content_index].ProcessData(temp.data(), temp.data(), temp.size());
     }
 
@@ -1078,7 +1051,8 @@ InstallStatus InstallCIA(const std::string& path,
             Core::System::GetInstance(),
             Service::AM::GetTitleMediaType(container.GetTitleMetadata().GetTitleID()));
 
-        if (container.GetTitleMetadata().HasEncryptedContent(container.GetHeader())) {
+        bool title_key_available = container.GetTicket().GetTitleKey().has_value();
+        if (!title_key_available && container.GetTitleMetadata().HasEncryptedContent(container.GetHeader())) {
             LOG_ERROR(Service_AM, "File {} is encrypted! Aborting...", path);
             return InstallStatus::ErrorEncrypted;
         }
@@ -1207,6 +1181,96 @@ ResultVal<std::pair<TitleInfo, std::unique_ptr<Loader::SMDH>>> GetCIAInfos(
     }
 
     return ResultUnknown;
+}
+
+InstallStatus InstallFromNus(u64 title_id, int version) {
+    LOG_DEBUG(Service_AM, "Downloading {:X}", title_id);
+
+    CIAFile install_file{Core::System::GetInstance(), GetTitleMediaType(title_id)};
+
+    std::string path = fmt::format("/ccs/download/{:016X}/tmd", title_id);
+    if (version != -1) {
+        path += fmt::format(".{}", version);
+    }
+    auto tmd_response = Core::NUS::Download(path);
+    if (!tmd_response) {
+        LOG_ERROR(Service_AM, "Failed to download tmd for {:016X}", title_id);
+        return InstallStatus::ErrorFileNotFound;
+    }
+    FileSys::TitleMetadata tmd;
+    tmd.Load(*tmd_response);
+
+    path = fmt::format("/ccs/download/{:016X}/cetk", title_id);
+    auto cetk_response = Core::NUS::Download(path);
+    if (!cetk_response) {
+        LOG_ERROR(Service_AM, "Failed to download cetk for {:016X}", title_id);
+        return InstallStatus::ErrorFileNotFound;
+    }
+
+    std::vector<u8> content;
+    const auto content_count = tmd.GetContentCount();
+    for (std::size_t i = 0; i < content_count; ++i) {
+        const std::string filename = fmt::format("{:08x}", tmd.GetContentIDByIndex(i));
+        path = fmt::format("/ccs/download/{:016X}/{}", title_id, filename);
+        const auto temp_response = Core::NUS::Download(path);
+        if (!temp_response) {
+            LOG_ERROR(Service_AM, "Failed to download content for {:016X}", title_id);
+            return InstallStatus::ErrorFileNotFound;
+        }
+        content.insert(content.end(), temp_response->begin(), temp_response->end());
+    }
+
+    FileSys::CIAHeader fake_header{
+        .header_size = sizeof(FileSys::CIAHeader),
+        .type = 0,
+        .version = 0,
+        .cert_size = 0,
+        .tik_size = static_cast<u32_le>(cetk_response->size()),
+        .tmd_size = static_cast<u32_le>(tmd_response->size()),
+        .meta_size = 0,
+    };
+    for (u16 i = 0; i < content_count; ++i) {
+        fake_header.SetContentPresent(i);
+    }
+    std::vector<u8> header_data(sizeof(fake_header));
+    std::memcpy(header_data.data(), &fake_header, sizeof(fake_header));
+
+    std::size_t current_offset = 0;
+    const auto write_to_cia_file_aligned = [&install_file, &current_offset](std::vector<u8>& data) {
+        const u64 offset =
+            Common::AlignUp(current_offset + data.size(), FileSys::CIA_SECTION_ALIGNMENT);
+        data.resize(offset - current_offset, 0);
+        const auto result =
+            install_file.Write(current_offset, data.size(), true, false, data.data());
+        if (result.Failed()) {
+            LOG_ERROR(Service_AM, "CIA file installation aborted with error code {:08x}",
+                      result.Code().raw);
+            return InstallStatus::ErrorAborted;
+        }
+        current_offset += data.size();
+        return InstallStatus::Success;
+    };
+
+    auto result = write_to_cia_file_aligned(header_data);
+    if (result != InstallStatus::Success) {
+        return result;
+    }
+
+    result = write_to_cia_file_aligned(*cetk_response);
+    if (result != InstallStatus::Success) {
+        return result;
+    }
+
+    result = write_to_cia_file_aligned(*tmd_response);
+    if (result != InstallStatus::Success) {
+        return result;
+    }
+
+    result = write_to_cia_file_aligned(content);
+    if (result != InstallStatus::Success) {
+        return result;
+    }
+    return InstallStatus::Success;
 }
 
 u64 GetTitleUpdateId(u64 title_id) {

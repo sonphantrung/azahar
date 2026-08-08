@@ -73,7 +73,7 @@ void HostRoomWindow::UpdateGameList(QStandardItemModel* list) {
     game_list->clear();
     game_list->appendRow(new GameListItemPath(QStringLiteral("%none%"), {},
                                               std::numeric_limits<u64>::max(), 0,
-                                              Service::FS::MediaType::NAND, false, false));
+                                              Service::FS::MediaType::NAND, false));
     for (int i = 0; i < list->rowCount(); i++) {
         auto parent = list->item(i, 0);
         for (int j = 0; j < parent->rowCount(); j++) {
